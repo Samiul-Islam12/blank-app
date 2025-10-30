@@ -6,7 +6,7 @@ PyPDF2
 pypdf
 faiss-cpu
 sentence-transformers
-huggingface_hub
+huggingface_hub>=0.20.0
 transformers
 torch
 numpy

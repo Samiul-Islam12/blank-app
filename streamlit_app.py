@@ -14,8 +14,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFaceHub
+
+# HuggingFace imports
+from huggingface_hub import InferenceClient
 
 # Evaluation imports
 from sklearn.metrics.pairwise import cosine_similarity
@@ -220,37 +221,69 @@ def create_vectorstore(documents, embeddings):
 
 def query_model(model_name: str, model_id: str, vectorstore, query: str, 
                 api_token: str) -> tuple:
-    """Query a specific model and measure latency"""
+    """Query a specific model using HuggingFace Inference API and measure latency"""
     
     try:
-        # Initialize LLM
-        llm = HuggingFaceHub(
-            repo_id=model_id,
-            huggingfacehub_api_token=api_token,
-            model_kwargs={"temperature": 0.7, "max_length": 512}
-        )
+        # Initialize HuggingFace Inference Client
+        client = InferenceClient(token=api_token)
         
-        # Create QA chain
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-            return_source_documents=True
-        )
+        # Retrieve relevant documents
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        source_docs = retriever.get_relevant_documents(query)
+        context = "\n\n".join([doc.page_content for doc in source_docs])
+        
+        # Create prompt with context
+        prompt = f"""You are a helpful assistant. Answer the question based ONLY on the following context. If the answer cannot be found in the context, say "I cannot answer this based on the provided documents."
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
         
         # Measure latency
         start_time = time.time()
-        result = qa_chain.invoke({"query": query})
+        
+        # Call HuggingFace Inference API
+        response_text = ""
+        for message in client.chat_completion(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0.7,
+            stream=True
+        ):
+            if message.choices[0].delta.content:
+                response_text += message.choices[0].delta.content
+        
         latency = time.time() - start_time
         
-        response = result['result']
-        context = " ".join([doc.page_content for doc in result['source_documents']])
-        
-        return response, context, latency
+        return response_text.strip(), context, latency
     
     except Exception as e:
-        st.error(f"Error querying {model_name}: {str(e)}")
-        return f"Error: {str(e)}", "", 0.0
+        # Fallback to text generation if chat completion fails
+        try:
+            client = InferenceClient(token=api_token)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            source_docs = retriever.get_relevant_documents(query)
+            context = "\n\n".join([doc.page_content for doc in source_docs])
+            
+            prompt = f"""Context: {context}\n\nQuestion: {query}\n\nAnswer:"""
+            
+            start_time = time.time()
+            response = client.text_generation(
+                prompt,
+                model=model_id,
+                max_new_tokens=512,
+                temperature=0.7
+            )
+            latency = time.time() - start_time
+            
+            return response.strip(), context, latency
+        except Exception as e2:
+            st.error(f"Error querying {model_name}: {str(e2)}")
+            return f"Error: {str(e2)}", "", 0.0
 
 
 def create_comparison_charts(results_df: pd.DataFrame):

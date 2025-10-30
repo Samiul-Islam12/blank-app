@@ -126,7 +126,8 @@ The app will open in your default browser at `http://localhost:8501`
 - **PDF Processing**: PyPDF2 for document loading
 - **Embeddings**: HuggingFace sentence-transformers (all-MiniLM-L6-v2)
 - **Vector Store**: FAISS for efficient similarity search
-- **LLM Integration**: HuggingFace Hub API for model inference
+- **LLM Integration**: HuggingFace Inference API with InferenceClient for direct model access
+- **Streaming Support**: Real-time response generation with streaming
 - **Evaluation**: Multiple metrics libraries (bert-score, evaluate, nltk, scikit-learn)
 - **Visualization**: Plotly for interactive charts
 
@@ -143,7 +144,8 @@ Query → Retrieval → Context + Query → LLM → Response → Evaluation
 
 Key packages:
 - `streamlit` - Web application framework
-- `langchain` - LLM orchestration and RAG pipeline
+- `langchain` - Document processing and RAG pipeline
+- `huggingface_hub` - Official HuggingFace Inference API client
 - `transformers` - HuggingFace models and tokenizers
 - `faiss-cpu` - Vector similarity search
 - `bert-score` - BERTScore evaluation
