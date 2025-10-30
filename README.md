@@ -42,19 +42,61 @@ A comprehensive evaluation framework for comparing multiple Large Language Model
 
 ### Installation
 
+#### Option 1: Using Setup Scripts (Recommended)
+
+**Windows:**
+```powershell
+# Double-click setup.bat or run in PowerShell:
+.\setup.bat
+```
+
+**Linux/Mac:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+#### Option 2: Manual Installation
+
 1. **Clone the repository**
 ```bash
 git clone <your-repo-url>
 cd <repo-name>
 ```
 
-2. **Install dependencies**
+2. **Verify requirements.txt exists**
 ```bash
-pip install -r requirements.txt
+# On Linux/Mac:
+ls -l requirements.txt
+
+# On Windows (PowerShell):
+dir requirements.txt
 ```
 
-3. **Run the application**
+3. **Update pip (recommended)**
 ```bash
+# On Linux/Mac:
+python3 -m pip install --upgrade pip
+
+# On Windows:
+python -m pip install --upgrade pip
+```
+
+4. **Install dependencies**
+```bash
+# On Linux/Mac:
+python3 -m pip install -r requirements.txt
+
+# On Windows:
+python -m pip install -r requirements.txt
+```
+
+5. **Run the application**
+```bash
+# On Linux/Mac:
+streamlit run streamlit_app.py
+
+# On Windows:
 streamlit run streamlit_app.py
 ```
 
@@ -175,6 +217,44 @@ The system provides multiple visualization types:
 ## 🐛 Troubleshooting
 
 ### Common Issues
+
+**Error: "Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'"**
+
+This error occurs when the requirements.txt file is not found in your current directory.
+
+**Solutions:**
+1. **Verify you're in the correct directory:**
+   ```bash
+   # Check current directory
+   pwd  # On Linux/Mac
+   cd   # On Windows
+   
+   # List files to see if requirements.txt exists
+   ls   # On Linux/Mac
+   dir  # On Windows
+   ```
+
+2. **Download the complete repository:**
+   - If you downloaded a ZIP file, make sure it extracted completely
+   - If using git, clone the full repository:
+     ```bash
+     git clone <repository-url>
+     cd <repository-directory>
+     ```
+
+3. **Use the setup scripts:**
+   - Run `setup.bat` (Windows) or `./setup.sh` (Linux/Mac) - they will check for the file first
+
+4. **Manually create requirements.txt if needed:**
+   - Copy the requirements from the repository and create the file manually
+   - Ensure it's named exactly `requirements.txt` (case-sensitive on Linux/Mac)
+
+**Error: "pip version notice: A new release of pip is available"**
+- This is just a notice, not an error
+- Update pip before installing requirements:
+  ```bash
+  python -m pip install --upgrade pip
+  ```
 
 **Error: "API token is invalid"**
 - Verify your HuggingFace token is correct
