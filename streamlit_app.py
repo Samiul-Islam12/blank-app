@@ -4,26 +4,50 @@ from pathlib import Path
 import tempfile
 from typing import List, Optional
 from dotenv import load_dotenv
+import torch
+import time
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Hugging Face imports
+from huggingface_hub import login
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    BitsAndBytesConfig,
+    pipeline
+)
 
 # LangChain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_huggingface import HuggingFacePipeline
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+
+# Evaluation imports
+from evaluation_metrics import RAGEvaluator, format_evaluation_summary
 
 # Load environment variables
 load_dotenv()
 
 # Page configuration
 st.set_page_config(
-    page_title="RAG System",
+    page_title="RAG System - Hugging Face",
     page_icon="🤖",
     layout="wide"
 )
+
+# Available models configuration
+AVAILABLE_MODELS = {
+    "Qwen 2.5 - 3B (Recommended for 8GB VRAM)": "Qwen/Qwen2.5-3B-Instruct",
+    "Mistral 7B - Instruct v0.1 (Requires 12GB VRAM)": "mistralai/Mistral-7B-Instruct-v0.1",
+    "Llama 3.2 - 3B Instruct (Recommended for 8GB VRAM)": "meta-llama/Llama-3.2-3B-Instruct",
+}
 
 # Initialize session state
 if 'vectorstore' not in st.session_state:
@@ -32,6 +56,67 @@ if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'documents_loaded' not in st.session_state:
     st.session_state.documents_loaded = False
+if 'llm_loaded' not in st.session_state:
+    st.session_state.llm_loaded = False
+if 'llm' not in st.session_state:
+    st.session_state.llm = None
+if 'current_model' not in st.session_state:
+    st.session_state.current_model = None
+if 'evaluations' not in st.session_state:
+    st.session_state.evaluations = []
+if 'trial_counter' not in st.session_state:
+    st.session_state.trial_counter = 0
+if 'evaluator' not in st.session_state:
+    st.session_state.evaluator = None
+if 'enable_evaluation' not in st.session_state:
+    st.session_state.enable_evaluation = True
+
+@st.cache_resource
+def load_llm_model(model_name: str, hf_token: str):
+    """Load the Hugging Face model with quantization."""
+    try:
+        # Login to Hugging Face
+        login(hf_token)
+        
+        # BitsAndBytes configuration for 4-bit quantization
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+        
+        # Load model with quantization
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            quantization_config=bnb_config,
+            trust_remote_code=True
+        )
+        
+        # Create pipeline
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=512,
+            temperature=0.1,
+            top_p=0.95,
+            repetition_penalty=1.15,
+        )
+        
+        # Wrap in LangChain
+        llm = HuggingFacePipeline(pipeline=pipe)
+        
+        return llm, True, "✅ Model loaded successfully!"
+    
+    except Exception as e:
+        return None, False, f"❌ Error loading model: {str(e)}"
 
 def load_document(uploaded_file) -> List[Document]:
     """Load a document from an uploaded file."""
@@ -53,7 +138,7 @@ def load_document(uploaded_file) -> List[Document]:
     finally:
         os.unlink(tmp_file_path)
 
-def create_vectorstore(documents: List[Document], use_openai: bool = False):
+def create_vectorstore(documents: List[Document]):
     """Create a vector store from documents."""
     # Split documents into chunks
     text_splitter = RecursiveCharacterTextSplitter(
@@ -63,14 +148,10 @@ def create_vectorstore(documents: List[Document], use_openai: bool = False):
     )
     splits = text_splitter.split_documents(documents)
     
-    # Create embeddings
-    if use_openai and os.getenv("OPENAI_API_KEY"):
-        embeddings = OpenAIEmbeddings()
-    else:
-        # Use free local embeddings
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+    # Use local embeddings
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
     
     # Create vector store
     vectorstore = Chroma.from_documents(
@@ -81,30 +162,23 @@ def create_vectorstore(documents: List[Document], use_openai: bool = False):
     
     return vectorstore
 
-def create_qa_chain(vectorstore, use_openai: bool = False):
+def create_qa_chain(vectorstore, llm):
     """Create a QA chain with the vector store."""
-    # Custom prompt template
-    template = """Use the following pieces of context to answer the question at the end. 
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
-Use three sentences maximum and keep the answer as concise as possible.
+    # Custom prompt template optimized for instruction-following models
+    template = """You are a helpful AI assistant. Use the following context to answer the question.
+If you cannot find the answer in the context, say "I cannot find this information in the provided documents."
+Keep your answer concise and accurate.
 
 Context: {context}
 
 Question: {question}
 
-Helpful Answer:"""
+Answer:"""
     
     QA_CHAIN_PROMPT = PromptTemplate(
         input_variables=["context", "question"],
         template=template,
     )
-    
-    # Initialize LLM
-    if use_openai and os.getenv("OPENAI_API_KEY"):
-        llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-    else:
-        st.warning("⚠️ No OpenAI API key found. Please configure an LLM provider in the sidebar.")
-        return None
     
     # Create QA chain
     qa_chain = RetrievalQA.from_chain_type(
@@ -119,25 +193,53 @@ Helpful Answer:"""
 
 # Main UI
 st.title("🤖 LLM RAG System")
-st.markdown("### Retrieval-Augmented Generation with Document Q&A")
+st.markdown("### Retrieval-Augmented Generation with Hugging Face Models")
 
 # Sidebar for configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # LLM Provider selection
-    st.subheader("LLM Settings")
-    use_openai = st.checkbox("Use OpenAI", value=True)
+    # Model configuration
+    st.subheader("🤗 Hugging Face Model Settings")
     
-    if use_openai:
-        openai_api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=os.getenv("OPENAI_API_KEY", ""),
-            help="Enter your OpenAI API key"
-        )
-        if openai_api_key:
-            os.environ["OPENAI_API_KEY"] = openai_api_key
+    hf_token = st.text_input(
+        "Hugging Face Token",
+        type="password",
+        value=os.getenv("HF_TOKEN", ""),
+        help="Enter your Hugging Face API token"
+    )
+    
+    # Model selection dropdown
+    selected_model_display = st.selectbox(
+        "Select Model",
+        options=list(AVAILABLE_MODELS.keys()),
+        help="Choose from pre-configured models"
+    )
+    
+    selected_model = AVAILABLE_MODELS[selected_model_display]
+    
+    # Show current loaded model
+    if st.session_state.llm_loaded:
+        st.info(f"✅ **Current Model**: {st.session_state.current_model}")
+    
+    if st.button("Load Model", type="primary", disabled=st.session_state.llm_loaded):
+        with st.spinner(f"Loading {selected_model_display}... This may take a few minutes..."):
+            llm, success, message = load_llm_model(selected_model, hf_token)
+            if success:
+                st.session_state.llm = llm
+                st.session_state.llm_loaded = True
+                st.session_state.current_model = selected_model_display
+                st.success(message)
+            else:
+                st.error(message)
+    
+    if st.session_state.llm_loaded:
+        if st.button("Unload Model"):
+            st.session_state.llm = None
+            st.session_state.llm_loaded = False
+            st.session_state.current_model = None
+            st.cache_resource.clear()
+            st.rerun()
     
     st.divider()
     
@@ -150,7 +252,7 @@ with st.sidebar:
         help="Upload PDF or TXT files to build your knowledge base"
     )
     
-    if uploaded_files:
+    if uploaded_files and st.session_state.llm_loaded:
         if st.button("Process Documents", type="primary"):
             with st.spinner("Processing documents..."):
                 all_documents = []
@@ -159,14 +261,13 @@ with st.sidebar:
                     all_documents.extend(docs)
                 
                 if all_documents:
-                    st.session_state.vectorstore = create_vectorstore(
-                        all_documents, 
-                        use_openai=use_openai
-                    )
+                    st.session_state.vectorstore = create_vectorstore(all_documents)
                     st.session_state.documents_loaded = True
                     st.success(f"✅ Processed {len(uploaded_files)} document(s) with {len(all_documents)} page(s)")
                 else:
                     st.error("No documents could be loaded")
+    elif uploaded_files and not st.session_state.llm_loaded:
+        st.warning("⚠️ Please load the model first before processing documents")
     
     if st.session_state.documents_loaded:
         st.info(f"📚 Knowledge base is ready!")
@@ -179,95 +280,409 @@ with st.sidebar:
     st.divider()
     st.markdown("### 💡 How to use:")
     st.markdown("""
-1. Enter your OpenAI API key (or configure another LLM)
-2. Upload your documents (PDF or TXT)
-3. Click 'Process Documents'
-4. Ask questions about your documents!
+1. Enter your Hugging Face token
+2. Select a model from the dropdown
+3. Click 'Load Model' (first time: 5-10 min)
+4. Upload your documents (PDF or TXT)
+5. Click 'Process Documents'
+6. Ask questions about your documents!
     """)
+    
+    # Model info
+    with st.expander("ℹ️ Model Info & Requirements"):
+        st.markdown("""
+        **Available Models:**
+        
+        1. **Qwen 2.5 - 3B Instruct**
+           - VRAM: ~6GB (with 4-bit quantization)
+           - Speed: Fast
+           - Quality: Excellent for 3B size
+        
+        2. **Mistral 7B - Instruct v0.1**
+           - VRAM: ~10GB (with 4-bit quantization)
+           - Speed: Moderate
+           - Quality: Very high quality
+        
+        3. **Llama 3.2 - 3B Instruct**
+           - VRAM: ~6GB (with 4-bit quantization)
+           - Speed: Fast
+           - Quality: Excellent for 3B size
+        
+        **Quantization Settings:**
+        - Type: 4-bit NF4
+        - Compute: bfloat16
+        - Memory savings: ~75%
+        """)
 
 # Main chat interface
-if not st.session_state.documents_loaded:
-    st.info("👈 Please upload and process documents in the sidebar to get started!")
+if not st.session_state.llm_loaded:
+    st.info("👈 Please load the model in the sidebar to get started!")
     
-    # Example use cases
-    st.markdown("### 🎯 What you can do with this RAG system:")
+    # Model information
+    st.markdown("### 🎯 About This RAG System")
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
-        **📚 Document Analysis**
-        - Upload research papers, reports, or books
-        - Ask questions about the content
-        - Get accurate answers with sources
+        **🤗 Powered by Hugging Face**
+        - Choose from 3 models:
+          - Qwen 2.5 - 3B (Fast, 6GB VRAM)
+          - Mistral 7B (High quality, 10GB VRAM)
+          - Llama 3.2 - 3B (Fast, 6GB VRAM)
+        - 4-bit quantization for efficiency
+        - Runs locally - no API costs!
         """)
         
     with col2:
         st.markdown("""
-        **💼 Knowledge Management**
-        - Build a searchable knowledge base
-        - Query multiple documents at once
-        - Extract insights efficiently
+        **📚 Features**
+        - Upload multiple documents
+        - Semantic search with embeddings
+        - Source citations
+        - Chat history
         """)
+
+elif not st.session_state.documents_loaded:
+    st.info("👈 Please upload and process documents in the sidebar!")
+    
+    st.markdown("### 📚 What you can do:")
+    st.markdown("""
+    - Upload research papers, reports, or books
+    - Ask questions about the content
+    - Get accurate answers with source citations
+    - Build a searchable knowledge base
+    """)
+    
 else:
-    # Chat interface
-    st.markdown("### 💬 Ask questions about your documents")
+    # Create tabs for Chat and Evaluation
+    tab1, tab2 = st.tabs(["💬 Chat", "📊 Evaluation Dashboard"])
     
-    # Display chat history
-    for chat in st.session_state.chat_history:
-        with st.chat_message("user"):
-            st.write(chat["question"])
-        with st.chat_message("assistant"):
-            st.write(chat["answer"])
-            if "sources" in chat and chat["sources"]:
-                with st.expander("📚 View Sources"):
-                    for i, source in enumerate(chat["sources"], 1):
-                        st.markdown(f"**Source {i}:**")
-                        st.text(source.page_content[:300] + "...")
-                        st.markdown("---")
-    
-    # Query input
-    query = st.chat_input("Ask a question about your documents...")
-    
-    if query:
-        # Display user message
-        with st.chat_message("user"):
-            st.write(query)
+    with tab1:
+        # Chat interface
+        st.markdown("### 💬 Ask questions about your documents")
         
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                qa_chain = create_qa_chain(st.session_state.vectorstore, use_openai=use_openai)
+        # Evaluation toggle
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            st.session_state.enable_evaluation = st.checkbox(
+                "Enable Evaluation", 
+                value=st.session_state.enable_evaluation,
+                help="Track metrics for each response"
+            )
+        
+        # Display chat history
+        for idx, chat in enumerate(st.session_state.chat_history):
+            with st.chat_message("user"):
+                st.write(chat["question"])
+            with st.chat_message("assistant"):
+                st.write(chat["answer"])
                 
-                if qa_chain:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    if "sources" in chat and chat["sources"]:
+                        with st.expander("📚 View Sources"):
+                            for i, source in enumerate(chat["sources"], 1):
+                                st.markdown(f"**Source {i}:**")
+                                st.text(source.page_content[:300] + "...")
+                                st.markdown("---")
+                
+                with col2:
+                    if "evaluation" in chat:
+                        with st.expander("📊 Metrics"):
+                            eval_data = chat["evaluation"]
+                            st.metric("Trial", f"#{eval_data.get('trial_number', 'N/A')}")
+                            st.metric("Latency", f"{eval_data.get('latency', 0):.3f}s")
+                            st.metric("Relevance", f"{eval_data.get('answer_relevance', 0):.3f}")
+                            st.metric("Trial Score", f"{eval_data.get('trial_score', 0):.1f}")
+        
+        # Query input
+        query = st.chat_input("Ask a question about your documents...")
+        
+        if query:
+            # Initialize evaluator if needed
+            if st.session_state.enable_evaluation and st.session_state.evaluator is None:
+                with st.spinner("Initializing evaluator..."):
+                    st.session_state.evaluator = RAGEvaluator()
+            
+            # Display user message
+            with st.chat_message("user"):
+                st.write(query)
+            
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
                     try:
+                        # Start timing
+                        start_time = time.time()
+                        
+                        qa_chain = create_qa_chain(
+                            st.session_state.vectorstore, 
+                            st.session_state.llm
+                        )
+                        
                         response = qa_chain({"query": query})
                         answer = response["result"]
                         source_docs = response.get("source_documents", [])
                         
+                        # End timing
+                        end_time = time.time()
+                        latency = end_time - start_time
+                        
                         st.write(answer)
                         
-                        if source_docs:
-                            with st.expander("📚 View Sources"):
-                                for i, doc in enumerate(source_docs, 1):
-                                    st.markdown(f"**Source {i}:**")
-                                    st.text(doc.page_content[:300] + "...")
-                                    st.markdown("---")
+                        # Evaluation
+                        evaluation_results = None
+                        if st.session_state.enable_evaluation and st.session_state.evaluator:
+                            with st.spinner("Evaluating response..."):
+                                st.session_state.trial_counter += 1
+                                
+                                # Extract context from source docs
+                                contexts = [doc.page_content for doc in source_docs]
+                                
+                                # Run comprehensive evaluation
+                                evaluation_results = st.session_state.evaluator.comprehensive_evaluation(
+                                    question=query,
+                                    answer=answer,
+                                    contexts=contexts,
+                                    latency=latency
+                                )
+                                
+                                # Calculate trial score
+                                trial_score = st.session_state.evaluator.calculate_trial_score(
+                                    evaluation_results,
+                                    st.session_state.trial_counter
+                                )
+                                
+                                evaluation_results["trial_number"] = st.session_state.trial_counter
+                                evaluation_results["trial_score"] = trial_score
+                                evaluation_results["model"] = st.session_state.current_model
+                                
+                                # Store evaluation
+                                st.session_state.evaluations.append(evaluation_results)
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            if source_docs:
+                                with st.expander("📚 View Sources"):
+                                    for i, doc in enumerate(source_docs, 1):
+                                        st.markdown(f"**Source {i}:**")
+                                        st.text(doc.page_content[:300] + "...")
+                                        st.markdown("---")
+                        
+                        with col2:
+                            if evaluation_results:
+                                with st.expander("📊 Metrics"):
+                                    st.metric("Trial", f"#{evaluation_results['trial_number']}")
+                                    st.metric("Latency", f"{latency:.3f}s")
+                                    st.metric("Relevance", f"{evaluation_results.get('answer_relevance', 0):.3f}")
+                                    st.metric("Trial Score", f"{trial_score:.1f}")
                         
                         # Save to chat history
-                        st.session_state.chat_history.append({
+                        chat_entry = {
                             "question": query,
                             "answer": answer,
                             "sources": source_docs
-                        })
+                        }
+                        if evaluation_results:
+                            chat_entry["evaluation"] = evaluation_results
+                        
+                        st.session_state.chat_history.append(chat_entry)
+                        
                     except Exception as e:
                         st.error(f"Error generating response: {str(e)}")
-                else:
-                    st.error("Please configure an LLM provider to generate answers.")
+    
+    with tab2:
+        # Evaluation Dashboard
+        st.markdown("### 📊 Evaluation Dashboard")
+        
+        if not st.session_state.evaluations:
+            st.info("💡 Enable evaluation in the Chat tab and ask questions to see metrics here!")
+            
+            st.markdown("""
+            **Available Metrics:**
+            - **Trial Score**: Overall performance (0-100)
+            - **Latency**: Response time in seconds
+            - **Cosine Similarity**: Semantic similarity scores
+            - **BERTScore F1**: Semantic similarity using BERT
+            - **Completeness**: How complete the answer is
+            - **Hallucination Risk**: Likelihood of fabricated information
+            - **Relevance**: How relevant the answer is to the question
+            - **BLEU Score**: N-gram overlap with reference
+            - **METEOR Score**: Unigram precision/recall
+            """)
+        else:
+            # Create DataFrame from evaluations
+            df = pd.DataFrame(st.session_state.evaluations)
+            
+            # Summary statistics
+            st.markdown("#### 📈 Summary Statistics")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Trials", len(st.session_state.evaluations))
+                st.metric("Avg Latency", f"{df['latency'].mean():.3f}s")
+            
+            with col2:
+                avg_score = df['trial_score'].mean() if 'trial_score' in df else 0
+                st.metric("Avg Trial Score", f"{avg_score:.1f}")
+                st.metric("Avg Relevance", f"{df['answer_relevance'].mean():.3f}")
+            
+            with col3:
+                st.metric("Avg Completeness", f"{df['completeness_score'].mean():.3f}")
+                st.metric("Avg Hallucination", f"{df['hallucination_score'].mean():.3f}")
+            
+            with col4:
+                st.metric("Avg Context Sim", f"{df['context_similarity'].mean():.3f}")
+                st.metric("Avg Irrelevance", f"{df['irrelevance_score'].mean():.3f}")
+            
+            st.divider()
+            
+            # Visualizations
+            st.markdown("#### 📊 Metric Comparisons")
+            
+            # Trial Scores comparison
+            fig_trials = go.Figure()
+            fig_trials.add_trace(go.Bar(
+                x=[f"Trial {i}" for i in df['trial_number']],
+                y=df['trial_score'] if 'trial_score' in df else [0] * len(df),
+                name='Trial Score',
+                marker_color='lightblue'
+            ))
+            fig_trials.update_layout(
+                title="Trial Scores Comparison",
+                xaxis_title="Trial",
+                yaxis_title="Score (0-100)",
+                height=400
+            )
+            st.plotly_chart(fig_trials, use_container_width=True)
+            
+            # Latency comparison
+            fig_latency = go.Figure()
+            fig_latency.add_trace(go.Bar(
+                x=[f"Trial {i}" for i in df['trial_number']],
+                y=df['latency'],
+                name='Latency',
+                marker_color='coral'
+            ))
+            fig_latency.update_layout(
+                title="Latency Comparison (Lower is Better)",
+                xaxis_title="Trial",
+                yaxis_title="Latency (seconds)",
+                height=400
+            )
+            st.plotly_chart(fig_latency, use_container_width=True)
+            
+            # Multi-metric comparison
+            metrics_to_plot = ['answer_relevance', 'completeness_score', 'context_similarity']
+            fig_multi = go.Figure()
+            
+            for metric in metrics_to_plot:
+                if metric in df.columns:
+                    fig_multi.add_trace(go.Bar(
+                        name=metric.replace('_', ' ').title(),
+                        x=[f"Trial {i}" for i in df['trial_number']],
+                        y=df[metric]
+                    ))
+            
+            fig_multi.update_layout(
+                title="Quality Metrics Comparison (Higher is Better)",
+                xaxis_title="Trial",
+                yaxis_title="Score",
+                barmode='group',
+                height=400
+            )
+            st.plotly_chart(fig_multi, use_container_width=True)
+            
+            # Hallucination and Irrelevance (lower is better)
+            fig_risk = go.Figure()
+            fig_risk.add_trace(go.Bar(
+                name='Hallucination Score',
+                x=[f"Trial {i}" for i in df['trial_number']],
+                y=df['hallucination_score'],
+                marker_color='red'
+            ))
+            fig_risk.add_trace(go.Bar(
+                name='Irrelevance Score',
+                x=[f"Trial {i}" for i in df['trial_number']],
+                y=df['irrelevance_score'],
+                marker_color='orange'
+            ))
+            fig_risk.update_layout(
+                title="Risk Metrics (Lower is Better)",
+                xaxis_title="Trial",
+                yaxis_title="Score",
+                barmode='group',
+                height=400
+            )
+            st.plotly_chart(fig_risk, use_container_width=True)
+            
+            # BERTScore, BLEU, METEOR (if available)
+            if 'bertscore_f1' in df.columns:
+                fig_nlp = go.Figure()
+                
+                if 'bertscore_f1' in df.columns:
+                    fig_nlp.add_trace(go.Bar(
+                        name='BERTScore F1',
+                        x=[f"Trial {i}" for i in df['trial_number']],
+                        y=df['bertscore_f1']
+                    ))
+                if 'bleu_score' in df.columns:
+                    fig_nlp.add_trace(go.Bar(
+                        name='BLEU Score',
+                        x=[f"Trial {i}" for i in df['trial_number']],
+                        y=df['bleu_score']
+                    ))
+                if 'meteor_score' in df.columns:
+                    fig_nlp.add_trace(go.Bar(
+                        name='METEOR Score',
+                        x=[f"Trial {i}" for i in df['trial_number']],
+                        y=df['meteor_score']
+                    ))
+                
+                fig_nlp.update_layout(
+                    title="NLP Metrics (Requires Reference Answer)",
+                    xaxis_title="Trial",
+                    yaxis_title="Score",
+                    barmode='group',
+                    height=400
+                )
+                st.plotly_chart(fig_nlp, use_container_width=True)
+            
+            st.divider()
+            
+            # Detailed evaluation table
+            st.markdown("#### 📋 Detailed Evaluation Data")
+            
+            # Select columns to display
+            display_cols = ['trial_number', 'latency', 'trial_score', 'answer_relevance', 
+                          'completeness_score', 'hallucination_score', 'irrelevance_score',
+                          'context_similarity']
+            
+            available_cols = [col for col in display_cols if col in df.columns]
+            st.dataframe(df[available_cols].round(4), use_container_width=True)
+            
+            # Export functionality
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("Clear Evaluations"):
+                    st.session_state.evaluations = []
+                    st.session_state.trial_counter = 0
+                    st.rerun()
+            
+            with col2:
+                # Download evaluations as CSV
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Evaluation Data (CSV)",
+                    data=csv,
+                    file_name="rag_evaluations.csv",
+                    mime="text/csv"
+                )
 
 # Footer
 st.divider()
 st.markdown("""
 <div style='text-align: center; color: gray; padding: 20px;'>
-    <p>Built with LangChain, Streamlit, and ChromaDB | RAG System v1.0</p>
+    <p>Built with 🤗 Hugging Face, LangChain, Streamlit, and ChromaDB | RAG System v2.0</p>
 </div>
 """, unsafe_allow_html=True)
