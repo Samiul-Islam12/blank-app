@@ -1,1 +1,24 @@
 streamlit
+langchain
+langchain-community
+langchain-huggingface
+chromadb
+sentence-transformers
+pypdf
+python-dotenv
+transformers
+huggingface_hub
+bitsandbytes
+accelerate
+torch
+# Evaluation metrics
+ragas
+bert-score
+nltk
+rouge-score
+scikit-learn
+numpy
+pandas
+plotly
+matplotlib
+seaborn
